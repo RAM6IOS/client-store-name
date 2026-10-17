@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+out/
+.next/
+*.tsbuildinfo
+
+# Turborepo
+.turbo/
+
+# Test / coverage
+coverage/
+
+# Prisma generated client (regenerate with `pnpm db:generate`)
+apps/api/src/generated/
+
+# Environment files (NEVER commit real secrets)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Secrets / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

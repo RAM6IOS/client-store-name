@@ -1,0 +1,562 @@
+// BITA COD Starter - Prisma schema
+//
+// Phase 1 shipped the StoreSetting + Currency reference models to prove the
+// schema + migration + client-generation workflow end to end.
+//
+// Phase 2 adds the catalog and inventory domain (see docs/database-design.md
+// and docs/api/catalog-and-inventory.md):
+//   Catalog:   Category, Product, ProductCategory, ProductImage, ProductVariant
+//   Inventory: InventoryItem, InventoryMovement
+//
+// Phase 3 adds the Algeria-first COD checkout + order domain (see
+// docs/api/orders.md):
+//   Delivery:  Wilaya, DeliveryRate (configuration-driven pricing)
+//   Orders:    Order, OrderItem, OrderStatusHistory, InventoryReservation,
+//              IdempotencyKey
+//
+// Money is stored as BIGINT minor units plus an ISO-4217 currency_code
+// (ADR-0005). The minor-unit exponent comes from Currency.minor_digits.
+// Inventory counters are guarded by DB CHECK constraints and updated inside
+// row-locked transactions to prevent overselling (ADR-0008). Order pricing is
+// snapshotted and recomputed only on the server.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "cjs"
+  runtime             = "nodejs"
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Store-wide configuration (single row in practice).
+model StoreSetting {
+  id                       String   @id @default(cuid())
+  name                     String
+  default_locale           String   @default("ar")
+  base_currency            String   @default("dzd") @db.VarChar(3)
+  cod_enabled              Boolean  @default(true)
+  /// How long an unconfirmed (pending_confirmation) COD order holds its stock.
+  reservation_ttl_minutes  Int      @default(60) @map("reservation_ttl_minutes")
+  created_at               DateTime @default(now()) @map("created_at")
+  updated_at               DateTime @updatedAt @map("updated_at")
+
+  @@map("store_settings")
+}
+
+/// Supported currencies and their display precision (minor-unit exponent).
+model Currency {
+  code         String  @id @db.VarChar(3)
+  name         String
+  minor_digits Int     @default(2) @map("minor_digits")
+  is_active    Boolean @default(true) @map("is_active")
+  is_default   Boolean @default(false) @map("is_default")
+
+  @@map("currencies")
+}
+
+// ──────────────────────────────── Catalog ───────────────────────────────────
+
+enum ProductStatus {
+  draft
+  published
+  archived
+}
+
+/// Category tree. Self-referential; deleting a parent detaches children.
+model Category {
+  id          String            @id @default(cuid())
+  name        String
+  slug        String            @unique
+  description String?
+  parent_id   String?
+  parent      Category?         @relation("CategoryChildren", fields: [parent_id], references: [id], onDelete: SetNull)
+  children    Category[]        @relation("CategoryChildren")
+  position    Int               @default(0)
+  is_active   Boolean           @default(true) @map("is_active")
+  created_at  DateTime          @default(now()) @map("created_at")
+  updated_at  DateTime          @updatedAt @map("updated_at")
+  products    ProductCategory[]
+
+  @@index([parent_id])
+  @@index([is_active])
+  @@map("categories")
+}
+
+/// A sellable product. Simple products carry one default variant; variant
+/// products carry many. See ProductVariant.
+model Product {
+  id          String            @id @default(cuid())
+  title       String
+  description String?
+  handle      String            @unique
+  status      ProductStatus     @default(draft)
+  thumbnail   String?
+  is_featured Boolean           @default(false) @map("is_featured")
+  created_at  DateTime          @default(now()) @map("created_at")
+  updated_at  DateTime          @updatedAt @map("updated_at")
+  images      ProductImage[]
+  variants    ProductVariant[]
+  categories  ProductCategory[]
+  options     ProductOption[]
+
+  @@index([status])
+  @@index([is_featured])
+  @@map("products")
+}
+
+/// Product option (e.g. Color, Size).
+model ProductOption {
+  id         String               @id @default(cuid())
+  product_id String
+  product    Product              @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  title      String
+  position   Int                  @default(0)
+  values     ProductOptionValue[]
+  variants   VariantOptionValue[]
+
+  @@index([product_id, position])
+  @@map("product_options")
+}
+
+/// Product option value (e.g. Red, Black, 40, 35).
+model ProductOptionValue {
+  id         String               @id @default(cuid())
+  option_id  String
+  option     ProductOption        @relation(fields: [option_id], references: [id], onDelete: Cascade)
+  value      String
+  position   Int                  @default(0)
+  variants   VariantOptionValue[]
+
+  @@index([option_id, position])
+  @@map("product_option_values")
+}
+
+/// Join table between variant, option, and option value.
+model VariantOptionValue {
+  variant_id      String
+  variant         ProductVariant     @relation(fields: [variant_id], references: [id], onDelete: Cascade)
+  option_id       String
+  option          ProductOption      @relation(fields: [option_id], references: [id], onDelete: Cascade)
+  option_value_id String
+  option_value    ProductOptionValue @relation(fields: [option_value_id], references: [id], onDelete: Cascade)
+
+  @@id([variant_id, option_id])
+  @@index([option_value_id])
+  @@map("variant_option_values")
+}
+
+/// Explicit product<->category join with per-product ordering.
+model ProductCategory {
+  product_id  String
+  category_id String
+  position    Int      @default(0)
+  product     Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  category    Category @relation(fields: [category_id], references: [id], onDelete: Cascade)
+
+  @@id([product_id, category_id])
+  @@index([category_id])
+  @@map("product_categories")
+}
+
+/// Product media. `rank` orders images within a product.
+model ProductImage {
+  id         String   @id @default(cuid())
+  product_id String
+  product    Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  url        String
+  alt        String?
+  rank       Int      @default(0)
+  created_at DateTime @default(now()) @map("created_at")
+
+  @@index([product_id, rank])
+  @@map("product_images")
+}
+
+/// A stock-keeping variant of a product (the default variant for simple
+/// products). `sku` is unique case-insensitively at the service layer (the
+/// API normalises SKUs to upper-case before persisting).
+model ProductVariant {
+  id                String              @id @default(cuid())
+  product_id        String
+  product           Product             @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  title             String
+  sku               String?             @unique
+  position          Int                 @default(0)
+  is_default        Boolean             @default(false) @map("is_default")
+  price_amount      BigInt              @map("price_amount")
+  compare_at_amount BigInt?             @map("compare_at_amount")
+  currency_code     String              @db.VarChar(3) @map("currency_code")
+  manage_inventory  Boolean             @default(true) @map("manage_inventory")
+  allow_backorder   Boolean             @default(false) @map("allow_backorder")
+  image             String?
+  is_active         Boolean             @default(true) @map("is_active")
+  created_at        DateTime            @default(now()) @map("created_at")
+  updated_at        DateTime            @updatedAt @map("updated_at")
+  inventory_item    InventoryItem?
+  option_values     VariantOptionValue[]
+
+  @@index([product_id, position])
+  @@map("product_variants")
+}
+
+// ────────────────────────────── Inventory ───────────────────────────────────
+
+/// One-to-one stock holder for a variant. Invariants (enforced by DB CHECK
+/// constraints added in the Phase 2 migration):
+///   stocked_quantity >= 0
+///   reserved_quantity >= 0
+///   reserved_quantity <= stocked_quantity
+/// available = stocked_quantity - reserved_quantity.
+model InventoryItem {
+  id                String              @id @default(cuid())
+  variant_id        String              @unique @map("variant_id")
+  variant           ProductVariant      @relation(fields: [variant_id], references: [id], onDelete: Cascade)
+  stocked_quantity  Int                 @default(0) @map("stocked_quantity")
+  reserved_quantity Int                 @default(0) @map("reserved_quantity")
+  created_at        DateTime            @default(now()) @map("created_at")
+  updated_at        DateTime            @updatedAt @map("updated_at")
+  movements         InventoryMovement[]
+  reservations      InventoryReservation[]
+
+  @@index([stocked_quantity])
+  @@map("inventory_items")
+}
+
+enum InventoryMovementType {
+  receipt
+  adjustment
+  return
+  reservation
+  release
+  sale
+}
+
+/// Append-only inventory ledger. Every counter change writes exactly one row
+/// in the same transaction as the update (ADR-0008).
+model InventoryMovement {
+  id                String                @id @default(cuid())
+  inventory_item_id String                @map("inventory_item_id")
+  inventory_item    InventoryItem         @relation(fields: [inventory_item_id], references: [id], onDelete: Cascade)
+  type              InventoryMovementType
+  stocked_delta     Int                   @default(0) @map("stocked_delta")
+  reserved_delta    Int                   @default(0) @map("reserved_delta")
+  stocked_after     Int                   @map("stocked_after")
+  reserved_after    Int                   @map("reserved_after")
+  reason            String?
+  reference         String?
+  created_by        String?               @map("created_by")
+  created_at        DateTime              @default(now()) @map("created_at")
+
+  @@index([inventory_item_id, created_at])
+  @@index([reference])
+  @@map("inventory_movements")
+}
+
+// ─────────────────────────────── Delivery ──────────────────────────────────
+
+enum DeliveryMethod {
+  home
+  stop_desk
+}
+
+/// Outcome of cross-checking a location row against the Journal Officiel text.
+/// `verified` = matched a JO label; `spelling_variant` = matched a JO label
+/// after fuzzy comparison (transliteration difference); `unmatched` = no JO
+/// label could be assigned; `unchecked` = no per-commune JO text available.
+enum LocationReviewStatus {
+  verified
+  spelling_variant
+  unmatched
+  unchecked
+}
+
+/// Reference list of Algerian wilayas (69 since the 2026 territorial division,
+/// loi n° 26-06 / JO n° 25). `code` is the official 2-digit code ("01".."69");
+/// names are stored in Arabic and French. `is_active` lets a store hide a
+/// destination without deleting history.
+model Wilaya {
+  id          String               @id @default(cuid())
+  code        String               @unique @db.VarChar(2)
+  name_ar     String
+  name_fr     String
+  latitude    Float?
+  longitude   Float?
+  position    Int                  @default(0)
+  is_active   Boolean              @default(true) @map("is_active")
+  created_at  DateTime             @default(now()) @map("created_at")
+  updated_at  DateTime             @default(now()) @updatedAt @map("updated_at")
+  rates       DeliveryRate[]
+  communes    Commune[]
+  legacy_codes LegacyLocationCode[]
+
+  @@index([is_active])
+  @@map("wilayas")
+}
+
+/// A commune (municipality) belonging to a wilaya. `code` is the stable
+/// internal identifier sourced from the imported dataset; `post_code` is the
+/// Algerian postal code and is also unique. `verification_status` records how
+/// the row was validated against the Journal Officiel (see
+/// docs/shipping-location-data.md).
+model Commune {
+  id                  String               @id @default(cuid())
+  code                String               @unique
+  post_code           String               @unique @map("post_code")
+  name_fr             String               @map("name_fr")
+  name_ar             String               @map("name_ar")
+  daira               String?
+  daira_ar            String?              @map("daira_ar")
+  wilaya_code         String               @db.VarChar(2) @map("wilaya_code")
+  wilaya              Wilaya               @relation(fields: [wilaya_code], references: [code], onDelete: Cascade)
+  latitude            Float?
+  longitude           Float?
+  verification_status LocationReviewStatus @default(unchecked) @map("verification_status")
+  verification_note   String?              @map("verification_note")
+  is_active           Boolean              @default(true) @map("is_active")
+  created_at          DateTime             @default(now()) @map("created_at")
+  updated_at          DateTime             @updatedAt @map("updated_at")
+  legacy_codes        LegacyLocationCode[]
+
+  @@index([wilaya_code])
+  @@index([name_fr])
+  @@index([is_active])
+  @@map("communes")
+}
+
+/// Mapping between a carrier/provider's own location codes and our stable
+/// internal locations. Kept separate from administrative data so carrier
+/// coverage never rewrites the reference list. One code per (provider, code).
+model LegacyLocationCode {
+  id           String   @id @default(cuid())
+  provider     String
+  legacy_code  String   @map("legacy_code")
+  wilaya_code  String?  @db.VarChar(2) @map("wilaya_code")
+  wilaya       Wilaya?  @relation(fields: [wilaya_code], references: [code], onDelete: SetNull)
+  commune_code String?  @map("commune_code")
+  commune      Commune? @relation(fields: [commune_code], references: [code], onDelete: SetNull)
+  label        String?
+  created_at   DateTime @default(now()) @map("created_at")
+
+  @@unique([provider, legacy_code])
+  @@index([wilaya_code])
+  @@index([commune_code])
+  @@map("legacy_location_codes")
+}
+
+/// Configuration-driven delivery pricing (Phase 3, extended in Phase 4). A rate
+/// row decides which delivery methods are available for a wilaya and what they
+/// cost; rates are store configuration (seeded with demo placeholders), never
+/// assumed tariffs. `provider` is "" for the store's own rates and a carrier key
+/// for provider-specific rates. One rate per (wilaya, method, currency,
+/// provider). `commune` granularity remains a documented future extension.
+model DeliveryRate {
+  id            String         @id @default(cuid())
+  wilaya_code   String         @db.VarChar(2) @map("wilaya_code")
+  wilaya        Wilaya         @relation(fields: [wilaya_code], references: [code], onDelete: Cascade)
+  method        DeliveryMethod
+  currency_code String         @db.VarChar(3) @map("currency_code")
+  /// "" = store tariff; otherwise the shipping provider key (e.g. a carrier).
+  provider      String         @default("")
+  /// Delivery fee in integer minor units (ADR-0005).
+  fee_amount    BigInt         @map("fee_amount")
+  label         String?
+  is_active     Boolean        @default(true) @map("is_active")
+  created_at    DateTime       @default(now()) @map("created_at")
+  updated_at    DateTime       @updatedAt @map("updated_at")
+
+  @@unique([wilaya_code, method, currency_code, provider])
+  @@index([method, is_active])
+  @@index([provider, is_active])
+  @@map("delivery_rates")
+}
+
+// ──────────────────────────────── Orders ───────────────────────────────────
+
+/// COD order lifecycle (brief states; see docs/api/orders.md). Shipment and
+/// financial collection are tracked separately from the order lifecycle.
+enum OrderStatus {
+  pending_confirmation
+  confirmed
+  preparing
+  dispatched
+  shipped
+  delivered
+  cancelled
+  delivery_failed
+  returned
+  no_answer
+  wrong_number
+}
+
+enum ShipmentStatus {
+  pending
+  shipped
+  delivered
+  failed
+  returned
+}
+
+enum CollectionStatus {
+  cod_pending
+  cod_collected
+  cod_remitted
+}
+
+/// Per-order-variant stock hold. `inventory_items.reserved_quantity` is the
+/// denormalised counter updated in the same transaction (ADR-0008).
+enum ReservationStatus {
+  held
+  released
+  committed
+}
+
+/// An order. Customer + address + pricing are all snapshotted at create time so
+/// later changes to products, rates or profiles never rewrite history.
+model Order {
+  id                String             @id @default(cuid())
+  /// Customer-facing order number (Postgres sequence).
+  display_id        Int                @unique @default(autoincrement())
+  status            OrderStatus        @default(pending_confirmation)
+  shipment_status   ShipmentStatus     @default(pending)
+  collection_status CollectionStatus   @default(cod_pending)
+
+  currency_code     String             @db.VarChar(3) @map("currency_code")
+  subtotal_amount   BigInt             @map("subtotal_amount")
+  shipping_amount   BigInt             @map("shipping_amount")
+  discount_amount   BigInt             @default(0) @map("discount_amount")
+  total_amount      BigInt             @map("total_amount")
+
+  /// guest checkout: name + Algerian phone; email optional
+  customer_name     String             @map("customer_name")
+  customer_phone    String             @map("customer_phone")
+  email             String?
+
+  delivery_method   DeliveryMethod     @map("delivery_method")
+  delivery_label    String?            @map("delivery_label")
+  /// Rate row used at quote time (kept even if rates are later edited).
+  delivery_rate_id  String?            @map("delivery_rate_id")
+  /// Provider key the quote/rate belongs to ("" = store tariff).
+  delivery_quote_provider String?      @map("delivery_quote_provider")
+  /// Immutable copy of the applicable delivery configuration at quote time.
+  delivery_quote_snapshot Json?        @map("delivery_quote_snapshot")
+  delivery_quote_issued_at  DateTime?  @map("delivery_quote_issued_at")
+  delivery_quote_expires_at DateTime?  @map("delivery_quote_expires_at")
+  wilaya_code       String             @db.VarChar(2) @map("wilaya_code")
+  wilaya_name       String             @map("wilaya_name")
+  /// Snapshot of the chosen commune (free text `commune` kept for history).
+  commune           String
+  commune_code      String?            @map("commune_code")
+  address_line      String?            @map("address_line")
+  nearby_landmark   String?            @map("nearby_landmark")
+  notes             String?
+
+  /// Stop-desk snapshot (when delivery_method = stop_desk and a provider
+  /// supplies desks). Kept on the order so later provider changes never rewrite
+  /// history.
+  stop_desk_id      String?            @map("stop_desk_id")
+  stop_desk_name    String?            @map("stop_desk_name")
+  stop_desk_provider String?           @map("stop_desk_provider")
+  stop_desk_address String?            @map("stop_desk_address")
+
+  /// Secure, unguessable public tracking token.
+  tracking_token    String?            @unique @map("tracking_token")
+
+  confirmed_at      DateTime?          @map("confirmed_at")
+  confirmed_by      String?            @map("confirmed_by")
+
+  placed_at         DateTime           @default(now()) @map("placed_at")
+  created_at        DateTime           @default(now()) @map("created_at")
+  updated_at        DateTime           @updatedAt @map("updated_at")
+
+  items             OrderItem[]
+  status_history    OrderStatusHistory[]
+  reservations      InventoryReservation[]
+  idempotency_key   IdempotencyKey?
+
+  @@index([status])
+  @@index([created_at])
+  @@map("orders")
+}
+
+/// Immutable line-item snapshot. No FK to the catalog: orders survive product
+/// deletion and never recompute from live prices (ADR of Phase 3).
+model OrderItem {
+  id            String           @id @default(cuid())
+  order_id      String           @map("order_id")
+  order         Order            @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  variant_id    String?          @map("variant_id")
+  product_title String           @map("product_title")
+  variant_title String           @map("variant_title")
+  sku           String?
+  /// Selected product options at order time (JSON snapshot).
+  options       Json?
+  quantity      Int
+  unit_amount   BigInt           @map("unit_amount")
+  line_amount   BigInt           @map("line_amount")
+  currency_code String           @db.VarChar(3) @map("currency_code")
+  reservation   InventoryReservation?
+
+  @@index([order_id])
+  @@map("order_items")
+}
+
+/// Append-only order status ledger (who changed what, when, to what).
+model OrderStatusHistory {
+  id              String       @id @default(cuid())
+  order_id        String       @map("order_id")
+  order           Order        @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  from_status     OrderStatus? @map("from_status")
+  to_status       OrderStatus  @map("to_status")
+  shipment_status ShipmentStatus? @map("shipment_status")
+  note            String?
+  changed_by      String?      @map("changed_by")
+  created_at      DateTime     @default(now()) @map("created_at")
+
+  @@index([order_id, created_at])
+  @@map("order_status_history")
+}
+
+/// Durable stock hold per order line (ADR-0008). `variant_id` is a plain
+/// string (no FK) so history survives catalog deletion.
+model InventoryReservation {
+  id                String            @id @default(cuid())
+  order_id          String            @map("order_id")
+  order             Order             @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  order_item_id     String?           @unique @map("order_item_id")
+  order_item        OrderItem?        @relation(fields: [order_item_id], references: [id], onDelete: Cascade)
+  inventory_item_id String            @map("inventory_item_id")
+  inventory_item    InventoryItem     @relation(fields: [inventory_item_id], references: [id], onDelete: Cascade)
+  variant_id        String            @map("variant_id")
+  quantity          Int
+  status            ReservationStatus @default(held)
+  /// Set for unconfirmed orders; cleared once the order is confirmed.
+  expires_at        DateTime?         @map("expires_at")
+  released_at       DateTime?         @map("released_at")
+  committed_at      DateTime?         @map("committed_at")
+  created_at        DateTime          @default(now()) @map("created_at")
+
+  @@index([order_id])
+  @@index([status, expires_at])
+  @@index([inventory_item_id, status])
+  @@map("inventory_reservations")
+}
+
+/// Client idempotency keys: one order per (scope, key) (ADR-0009).
+model IdempotencyKey {
+  id           String    @id @default(cuid())
+  scope        String
+  key          String
+  request_hash String?   @map("request_hash")
+  order_id     String?   @unique @map("order_id")
+  order        Order?    @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  expires_at   DateTime? @map("expires_at")
+  created_at   DateTime  @default(now()) @map("created_at")
+
+  @@unique([scope, key])
+  @@index([expires_at])
+  @@map("idempotency_keys")
+}

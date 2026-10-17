@@ -1,0 +1,33 @@
+{
+  "name": "bita-cod-starter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BITA COD Starter - custom COD-focused ecommerce platform (NestJS + Next.js + PostgreSQL/Prisma)",
+  "packageManager": "pnpm@10.26.1",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "start": "turbo run start",
+    "test": "turbo run test",
+    "test:e2e": "pnpm --filter @bita/api test:e2e",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
+    "db:generate": "pnpm --filter @bita/api db:generate",
+    "db:validate": "pnpm --filter @bita/api db:validate",
+    "db:migrate": "pnpm --filter @bita/api db:migrate",
+    "db:deploy": "pnpm --filter @bita/api db:deploy",
+    "db:seed": "pnpm --filter @bita/api db:seed",
+    "db:reset": "pnpm --filter @bita/api db:reset",
+    "db:studio": "pnpm --filter @bita/api db:studio"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "turbo": "^2.11.7",
+    "typescript": "5.9.3"
+  }
+}

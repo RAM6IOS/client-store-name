@@ -1,0 +1,20 @@
+packages:
+  - "apps/*"
+  # `packages/*` is intentionally omitted until the first shared package is
+  # created. Shared packages are planned for Phase 2 (packages/contracts,
+  # packages/database, packages/config) per docs/decisions/0003-monorepo-tooling.md
+  # and docs/implementation-backlog.md. Re-add the glob when that package lands.
+
+# pnpm settings kept here (pnpm 10) to avoid polluting .npmrc for other tools.
+autoInstallPeers: true
+strictPeerDependencies: false
+linkWorkspacePackages: true
+preferWorkspacePackages: true
+
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - "prisma"
+  - "esbuild"
+  - "@swc/core"
+  - "sharp"
